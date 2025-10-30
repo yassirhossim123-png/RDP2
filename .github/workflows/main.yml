@@ -1,0 +1,138 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    # مدة التنفيذ القصوى (بالدقائق). غيّر إذا رغبت. لاحظ أن GitHub Actions قد يفرض حدود على المدد.
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          # تفعيل Remote Desktop وترك NLA مفعّل لأمان أفضل
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 1 -Force
+
+          # حذف أي قاعدة سابقة بنفس الاسم ثم إضافة قاعدة مؤقتة للسماح بالاتصالات على 3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # إعادة تشغيل خدمة RDP لضمان تطبيق الإعدادات
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          } else {
+            # لو المستخدم موجود نغيّر له الباس ورد
+            Set-LocalUser -Name "RDP" -Password $securePass
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+
+          # حفظ بيانات الدخول في متغير بيئة ليتم قراءته لاحقاً
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) {
+            Write-Error "tailscale binary not found after install."
+            exit 1
+          }
+
+          # نفّذ tailscale up مع auth key من الأسرار
+          & $tailscale up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # ننتظر للحصول على IP داخلي
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              Start-Sleep -Seconds 5
+              $ips = & $tailscale ip -4 2>$null
+              if ($ips) { $tsIP = ($ips -split "\r?\n" | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' })[0] }
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Show Access Info
+        shell: powershell
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          # اقرأ قيمة RDP_CREDS من المتغير
+          if (Test-Path env:RDP_CREDS) {
+            Write-Host "Password: $env:RDP_CREDS"
+          } else {
+            Write-Host "Password: (saved to job env variable RDP_CREDS)"
+          }
+          Write-Host "==================`n"
+
+      # ملاحظة: GitHub-hosted runners ستنتهي بعد انتهاء الـ job أو عند الوصول لل timeout.
+      # الخطوة التالية تبقى لتجربة قصيرة؛ عدم ترك حلقة لا نهائية هنا لأن الجوب ستُقتل من Github.
+      - name: Keep Alive (short demo)
+        shell: powershell
+        run: |
+          Write-Host "Keeping job alive for demonstration (5 minutes)..."
+          Start-Sleep -Seconds 300
+          Write-Host "Demo finished. To keep a machine permanently use VPS or self-hosted runner."
